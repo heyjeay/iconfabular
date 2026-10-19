@@ -2104,7 +2104,7 @@ static BOOL WINAPI TrackPopupMenuEx_Hook(HMENU menu, UINT flags, int x, int y,
 
 static std::wstring StripRunningSuffix(const std::wstring& name) {
     // "Firefox - 3 running windows" -> "Firefox"
-    static const wchar_t* kSeparators[] = {L" - ", L" — "};
+    static const wchar_t* kSeparators[] = {L" - ", L" \u2014 "};
     for (const wchar_t* separator : kSeparators) {
         size_t pos = name.find(separator);
         if (pos != std::wstring::npos && pos > 0) {
