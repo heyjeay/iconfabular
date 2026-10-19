@@ -1831,25 +1831,19 @@ static void RequestMenuAt(POINT screenPoint) {
     }
 }
 
-static LRESULT CALLBACK TaskbarSubclassProc(HWND window, UINT message, WPARAM wParam,
-                                            LPARAM lParam, UINT_PTR, DWORD_PTR) {
+// Shared by the Windows 10 subclass and the Windows 11 window-procedure
+// hook. Returns true when the gesture has consumed the message.
+static bool GestureConsumesMessage(UINT message, WPARAM wParam) {
     if (g_unloading) {
-        return DefSubclassProc(window, message, wParam, lParam);
+        return false;
     }
 
     switch (message) {
-        case WM_NCDESTROY: {
-            std::lock_guard<std::mutex> lock(g_subclassMutex);
-            g_subclassed.erase(window);
-            break;
-        }
-
         case WM_RBUTTONDOWN:
         case WM_NCRBUTTONDOWN:
-            if (GestureHeld()) {
-                return 0;  // swallowed; the menu goes up on the matching up-click
-            }
-            break;
+        case WM_CONTEXTMENU:
+            // Swallowed; the menu goes up on the matching up-click.
+            return GestureHeld();
 
         case WM_RBUTTONUP:
         case WM_NCRBUTTONUP:
@@ -1857,30 +1851,83 @@ static LRESULT CALLBACK TaskbarSubclassProc(HWND window, UINT message, WPARAM wP
                 POINT point;
                 GetCursorPos(&point);
                 RequestMenuAt(point);
-                return 0;
+                return true;
             }
-            break;
-
-        case WM_CONTEXTMENU:
-            if (GestureHeld()) {
-                return 0;
-            }
-            break;
+            return false;
 
         case WM_POINTERDOWN:
-            if (IFAB_POINTER_IS_RIGHT(wParam) && GestureHeld()) {
-                return 0;
-            }
-            break;
+            return IFAB_POINTER_IS_RIGHT(wParam) && GestureHeld();
 
         case WM_POINTERUP:
             if (IFAB_POINTER_IS_RIGHT(wParam) && GestureHeld()) {
                 POINT point;
                 GetCursorPos(&point);
                 RequestMenuAt(point);
-                return 0;
+                return true;
             }
-            break;
+            return false;
+    }
+    return false;
+}
+
+// Windows 11 routes taskbar mouse input through an InputSite window owned
+// by InputHost.dll. That code checks that its GWLP_WNDPROC has not been
+// changed and fails fast (0xC0000409 raised inside InputHost.dll) when it
+// has, so the window must never be subclassed. Its window procedure is
+// function-hooked instead, which leaves GWLP_WNDPROC alone.
+static std::mutex g_inputSiteMutex;
+static std::unordered_set<void*> g_hookedInputSiteProcs;
+static std::atomic<bool> g_whInitialized;
+
+using InputSiteWindowProc_t = LRESULT(CALLBACK*)(HWND, UINT, WPARAM, LPARAM);
+static InputSiteWindowProc_t InputSiteWindowProc_Original;
+
+static LRESULT CALLBACK InputSiteWindowProc_Hook(HWND window, UINT message,
+                                                 WPARAM wParam, LPARAM lParam) {
+    if (GestureConsumesMessage(message, wParam)) {
+        return 0;
+    }
+    return InputSiteWindowProc_Original(window, message, wParam, lParam);
+}
+
+static void HookInputSiteWindow(HWND window) {
+    if (g_unloading) {
+        return;
+    }
+    void* windowProc = (void*)GetWindowLongPtrW(window, GWLP_WNDPROC);
+    if (!windowProc) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(g_inputSiteMutex);
+    if (g_hookedInputSiteProcs.count(windowProc)) {
+        return;
+    }
+    if (!Wh_SetFunctionHook(windowProc, (void*)InputSiteWindowProc_Hook,
+                            (void**)&InputSiteWindowProc_Original)) {
+        Log(L"Could not hook the InputSite window procedure");
+        return;
+    }
+    // Hooks registered before Wh_ModInit returns are applied by Windhawk
+    // itself; later ones (from the rescan timer) have to be applied here.
+    if (g_whInitialized.load(std::memory_order_relaxed)) {
+        Wh_ApplyHookOperations();
+    }
+    g_hookedInputSiteProcs.insert(windowProc);
+    Log(L"Hooked the Windows 11 InputSite window procedure");
+}
+
+static LRESULT CALLBACK TaskbarSubclassProc(HWND window, UINT message, WPARAM wParam,
+                                            LPARAM lParam, UINT_PTR, DWORD_PTR) {
+    if (g_unloading) {
+        return DefSubclassProc(window, message, wParam, lParam);
+    }
+
+    if (message == WM_NCDESTROY) {
+        std::lock_guard<std::mutex> lock(g_subclassMutex);
+        g_subclassed.erase(window);
+    } else if (GestureConsumesMessage(message, wParam)) {
+        return 0;
     }
 
     return DefSubclassProc(window, message, wParam, lParam);
@@ -1931,19 +1978,22 @@ static bool SetSubclassFromAnyThread(HWND window, bool install) {
     return true;
 }
 
-static bool IsClickableTaskbarClass(HWND window) {
+static BOOL CALLBACK SubclassChildProc(HWND window, LPARAM) {
     wchar_t className[128]{};
     if (!GetClassNameW(window, className, ARRAYSIZE(className))) {
-        return false;
+        return TRUE;
     }
-    // Windows 10 button strip, and the input surface of the Windows 11 XAML
-    // taskbar (which is what actually receives the mouse there).
-    return wcscmp(className, L"MSTaskListWClass") == 0 ||
-           wcscmp(className, L"Windows.UI.Input.InputSite.WindowClass") == 0;
-}
 
-static BOOL CALLBACK SubclassChildProc(HWND window, LPARAM) {
-    if (IsClickableTaskbarClass(window)) {
+    // The input surface of the Windows 11 XAML taskbar. Hook its window
+    // procedure; subclassing it crashes explorer (see HookInputSiteWindow).
+    if (wcscmp(className, L"Windows.UI.Input.InputSite.WindowClass") == 0) {
+        HookInputSiteWindow(window);
+        return TRUE;
+    }
+
+    // The Windows 10 button strip is an ordinary window, so subclassing it
+    // is both safe and cleanly removable on unload.
+    if (wcscmp(className, L"MSTaskListWClass") == 0) {
         std::unique_lock<std::mutex> lock(g_subclassMutex);
         if (!g_subclassed.count(window)) {
             lock.unlock();
@@ -3313,6 +3363,8 @@ BOOL Wh_ModInit() {
         WaitForSingleObject(g_workerReady, 10000);
     }
 
+    // From here on, hooks added by the rescan timer must be applied here.
+    g_whInitialized.store(true, std::memory_order_relaxed);
     return TRUE;
 }
 

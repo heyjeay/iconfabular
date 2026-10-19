@@ -63,17 +63,34 @@ Debug in this order; each is independent.
 
 ### 1. Shift+right-click does nothing
 
-The gesture relies on subclassing the window that actually receives taskbar
-mouse input. `IsClickableTaskbarClass` accepts `MSTaskListWClass` (Win10) and
-`Windows.UI.Input.InputSite.WindowClass` (Win11). If your build routes input
-somewhere else, nothing is caught.
+**Do not subclass the Windows 11 InputSite window.** The first version of this
+mod did, and it crash-looped explorer on Windows 11 (build 26100/26300): every
+explorer instance died within seconds of the mod loading, with
 
-Diagnose: set `verboseLog`, then check whether `SetWindowsHookEx failed` appears,
-and whether anything is subclassed at all. Add a log line in `ScanTaskbar`
-listing the class name of every child of `Shell_TrayWnd` — that tells you what
-to add to `IsClickableTaskbarClass`. Also worth testing whether the taskbar
-sends `WM_RBUTTONUP` or `WM_POINTERUP` there; both are handled, but only one
-likely fires.
+```
+Faulting module name: InputHost.dll
+Exception code: 0xc0000409        (STATUS_STACK_BUFFER_OVERRUN / __fastfail)
+```
+
+`SetWindowSubclass` rewrites `GWLP_WNDPROC`; the InputHost code verifies that
+pointer is unchanged and fails fast when it is not. The published
+`taskbar-empty-space-clicks` mod hit the same wall and says so in its source.
+
+So the gesture is wired up two different ways, in `SubclassChildProc`:
+
+| Window | Mechanism |
+|---|---|
+| `MSTaskListWClass` (Win10) | `SetWindowSubclass` via `SetSubclassFromAnyThread` |
+| `Windows.UI.Input.InputSite.WindowClass` (Win11) | `Wh_SetFunctionHook` on its wndproc, in `HookInputSiteWindow` |
+
+Both funnel into `GestureConsumesMessage`, so the message handling stays in one
+place. A wndproc hook added after `Wh_ModInit` returns needs an explicit
+`Wh_ApplyHookOperations()` call, which is what `g_whInitialized` gates.
+
+If the gesture is simply not caught (no crash), log the class name of every
+child of `Shell_TrayWnd` in `ScanTaskbar` to see what your build actually uses,
+and check whether `WM_RBUTTONUP` or `WM_POINTERUP` is the one that fires — both
+are handled, but likely only one arrives.
 
 Fallback that must keep working regardless: **Ctrl+Alt+Shift+I** opens the
 manager, which is the whole feature minus the convenience.
