@@ -463,11 +463,15 @@ static void Log(PCWSTR message) {
     Wh_Log(L"%s", message);
 }
 
-static void VerboseLog(PCWSTR format, PCWSTR a, int b) {
-    if (g_settings.verboseLog) {
-        Wh_Log(format, a, b);
-    }
-}
+// Wh_Log is a macro that pastes a prefix onto its format string, so the format
+// has to be a string literal at the call site. That rules out a function taking
+// a PCWSTR format, which is why this is a macro.
+#define VerboseLog(format, ...)              \
+    do {                                     \
+        if (g_settings.verboseLog) {         \
+            Wh_Log(format, __VA_ARGS__);     \
+        }                                    \
+    } while (0)
 
 // ---------------------------------------------------------------------------
 // Taskbar thread bookkeeping

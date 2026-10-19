@@ -113,26 +113,36 @@ the setting off to test that theory in one click.
 - There is **no** `Wh_DeleteStringValue`. It is `Wh_DeleteValue(name)`.
 - Array settings are read as `Wh_GetStringSetting(L"overrides[%d].target", i)`.
 - Entry points (`Wh_ModInit` etc.) are plain functions, no `extern "C"`.
+- `Wh_Log` is a **macro**, not a function. It pastes a prefix onto the format
+  string (`InternalWh_Log_Wrapper(L"[%d:%S]: " message, __LINE__, ...)`), so the
+  format argument must be a *string literal* at the call site. A helper that
+  takes a `PCWSTR format` and forwards it to `Wh_Log` does not compile - that is
+  why `VerboseLog` is a variadic macro rather than a function.
 
 ## Compile-checking outside Windhawk
 
-Windhawk compiles the mod itself, but a cross-compiler catches errors faster:
+Windhawk compiles the mod itself, but you can reproduce its compile **exactly**
+using Windhawk's own bundled clang and headers, which is far more faithful than
+a MinGW cross-compiler with a stubbed API header (the stub declares `Wh_Log` as
+a function and so misses the macro-only errors above):
 
-```sh
-x86_64-w64-mingw32-g++ -std=c++20 -Wall -Wextra -municode \
-  -include windhawk_api_stub.h -c iconfabular.wh.cpp -o mod.o
+```powershell
+& "C:\Program Files\Windhawk\Compiler\bin\clang++.exe" `
+  -x c++ -std=c++23 -target x86_64-w64-mingw32 `
+  -DUNICODE -D_UNICODE -DWINVER=0x0A00 -D_WIN32_WINNT=0x0A00 -D_WIN32_IE=0x0A00 `
+  -DNTDDI_VERSION=0x0A000008 -D__USE_MINGW_ANSI_STDIO=0 -DWH_MOD `
+  -include windhawk_api.h `
+  -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers `
+  -Wno-cast-function-type-mismatch `
+  -fsyntax-only iconfabular.wh.cpp
 ```
 
-The stub header just declares the `Wh_*` functions listed above. Link check:
+The flags come from `C:\ProgramData\Windhawk\EditorWorkspace\compile_flags.txt`.
+Verified to produce byte-identical diagnostics to the Windhawk UI. Exit code 0
+means it will compile in Windhawk.
 
-```sh
-x86_64-w64-mingw32-g++ -shared -o out.dll mod.o stub.cpp \
-  -lcomctl32 -lcomdlg32 -lgdi32 -lole32 -loleaut32 -lshell32 -lshlwapi \
-  -luser32 -lwindowscodecs
-```
-
-This will not catch anything about behaviour — only syntax, types and missing
-libraries. Every real bug left in this mod is a runtime one.
+This still only catches syntax, types and missing libraries. Every real bug left
+in this mod is a runtime one.
 
 ## Test checklist
 
