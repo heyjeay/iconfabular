@@ -2008,6 +2008,33 @@ static BOOL CALLBACK SubclassChildProc(HWND window, LPARAM) {
 
 // Picks up the taskbar's threads and click targets. Called at init and
 // periodically afterwards, because explorer recreates these windows.
+// The hotkey is global, so only one process can own it. Register it from
+// whichever explorer instance owns the taskbar, so the manager window opens
+// in the process whose hooks and icon caches actually drive the buttons.
+static bool g_hotkeyRegistered;
+
+static void UpdateHotkeyRegistration(bool ownsTaskbar) {
+    if (!g_workerWindow) {
+        return;
+    }
+    bool wanted = g_settings.hotkey && ownsTaskbar && !g_unloading;
+    if (wanted == g_hotkeyRegistered) {
+        return;
+    }
+    if (wanted) {
+        if (RegisterHotKey(g_workerWindow, IFAB_HOTKEY_ID,
+                           MOD_CONTROL | MOD_ALT | MOD_SHIFT, L'I')) {
+            g_hotkeyRegistered = true;
+            Log(L"Manager hotkey Ctrl+Alt+Shift+I registered");
+        } else {
+            Log(L"Ctrl+Alt+Shift+I is taken; the manager hotkey is not available");
+        }
+    } else {
+        UnregisterHotKey(g_workerWindow, IFAB_HOTKEY_ID);
+        g_hotkeyRegistered = false;
+    }
+}
+
 static void ScanTaskbar() {
     if (g_unloading) {
         return;
@@ -2018,7 +2045,17 @@ static void ScanTaskbar() {
     for (PCWSTR className : {L"Shell_TrayWnd", L"Shell_SecondaryTrayWnd"}) {
         HWND tray = nullptr;
         while ((tray = FindWindowExW(nullptr, tray, className, nullptr)) != nullptr) {
-            DWORD threadId = GetWindowThreadProcessId(tray, nullptr);
+            // Several explorer.exe instances can be running, and the mod is
+            // loaded into all of them. Only one owns the taskbar; the others
+            // must keep their hands off it, or every scan burns work and
+            // SetWindowsHookEx fails with ERROR_ACCESS_DENIED on a thread
+            // that belongs to someone else.
+            DWORD processId = 0;
+            DWORD threadId = GetWindowThreadProcessId(tray, &processId);
+            if (processId != GetCurrentProcessId()) {
+                continue;
+            }
+
             bool known = false;
             for (size_t i = 0; i < slot; i++) {
                 known = known || threads[i] == threadId;
@@ -2035,6 +2072,8 @@ static void ScanTaskbar() {
     for (size_t i = 0; i < kMaxTaskbarThreads; i++) {
         g_taskbarThreads[i].store(i < slot ? threads[i] : 0, std::memory_order_relaxed);
     }
+
+    UpdateHotkeyRegistration(slot > 0);
 }
 
 static void UnsubclassAll() {
@@ -3248,13 +3287,8 @@ static DWORD WINAPI WorkerThreadProc(LPVOID) {
         return 1;
     }
 
-    if (g_settings.hotkey) {
-        if (!RegisterHotKey(g_workerWindow, IFAB_HOTKEY_ID,
-                            MOD_CONTROL | MOD_ALT | MOD_SHIFT, 'I')) {
-            Log(L"Ctrl+Alt+Shift+I is taken; the manager hotkey is not available");
-        }
-    }
-
+    // The hotkey is registered by ScanTaskbar below, once this process is
+    // known to own the taskbar.
     SetTimer(g_workerWindow, IDT_RESCAN, 3000, nullptr);
 
     // Publishing the overrides is quick; rendering them is not, so let
@@ -3276,7 +3310,10 @@ static DWORD WINAPI WorkerThreadProc(LPVOID) {
     }
     if (g_workerWindow) {
         KillTimer(g_workerWindow, IDT_RESCAN);
-        UnregisterHotKey(g_workerWindow, IFAB_HOTKEY_ID);
+        if (g_hotkeyRegistered) {
+            UnregisterHotKey(g_workerWindow, IFAB_HOTKEY_ID);
+            g_hotkeyRegistered = false;
+        }
         DestroyWindow(g_workerWindow);
         g_workerWindow = nullptr;
     }
